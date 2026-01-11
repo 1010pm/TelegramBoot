@@ -1,0 +1,20 @@
+{
+  "name": "wasl-ai-bot",
+  "version": "1.0.0",
+  "description": "Intelligent Telegram Bot with AI Agent, Gmail integration, and Session Memory",
+  "main": "index.js",
+  "scripts": {
+    "start": "node start.js",
+    "test": "node test-setup.js",
+    "dev": "node index.js"
+  },
+  "keywords": ["telegram", "bot", "ai", "agent", "gmail", "gemini"],
+  "author": "Wasl AI",
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.1",
+    "dotenv": "^17.2.3",
+    "nodemailer": "^7.0.10"
+  }
+}

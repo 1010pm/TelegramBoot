@@ -1,0 +1,824 @@
+/**
+ * Telegram Bot + Firebase + Google APIs Integration
+ * 
+ * هذا الملف يحتوي على جميع Cloud Functions للمشروع:
+ * - telegramWebhook: استقبال رسائل Telegram
+ * - oauthCallback: معالجة OAuth callback من Google
+ * - aiLogic: محاكي بسيط لاستخراج النية (Intent) من الرسائل
+ */
+
+require('dotenv').config();
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const axios = require('axios');
+const { google } = require('googleapis');
+
+// تهيئة Firebase Admin SDK
+admin.initializeApp();
+const db = admin.firestore();
+
+// =====================================
+// Configuration
+// =====================================
+
+const config = {
+  telegram: {
+    token: process.env.TELEGRAM_BOT_TOKEN || functions.config().telegram?.token,
+    apiUrl: null // سيتم تعيينه بعد تحميل token
+  },
+  google: {
+    clientId: process.env.GOOGLE_CLIENT_ID || functions.config().google?.client_id,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || functions.config().google?.client_secret,
+    redirectUri: process.env.OAUTH_REDIRECT_URI || functions.config().oauth?.redirect_uri
+  },
+  ai: {
+    logicUrl: process.env.AI_LOGIC_URL || functions.config().ai?.url
+  }
+};
+
+// تعيين Telegram API URL بعد تحميل token
+if (config.telegram.token) {
+  config.telegram.apiUrl = `https://api.telegram.org/bot${config.telegram.token}`;
+}
+
+// =====================================
+// Helper Functions
+// =====================================
+
+/**
+ * إرسال رسالة عبر Telegram
+ */
+async function sendTelegramMessage(chatId, text, options = {}) {
+  try {
+    const response = await axios.post(`${config.telegram.apiUrl}/sendMessage`, {
+      chat_id: chatId,
+      text: text,
+      parse_mode: options.parseMode || 'HTML',
+      ...options
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Error sending Telegram message:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+/**
+ * تسجيل log في Firestore
+ */
+async function logToFirestore(userId, level, message, meta = {}) {
+  try {
+    await db.collection('logs').add({
+      userId,
+      level,
+      message,
+      meta,
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (error) {
+    console.error('Error logging to Firestore:', error);
+  }
+}
+
+/**
+ * الحصول على Google OAuth Client مع tokens المحفوظة
+ */
+async function getGoogleOAuthClient(userId) {
+  const tokenDoc = await db
+    .collection('users')
+    .doc(userId)
+    .collection('tokens')
+    .doc('google')
+    .get();
+
+  if (!tokenDoc.exists) {
+    throw new Error('no_google_token');
+  }
+
+  const tokenData = tokenDoc.data();
+  
+  const oAuth2Client = new google.auth.OAuth2(
+    config.google.clientId,
+    config.google.clientSecret,
+    config.google.redirectUri
+  );
+
+  oAuth2Client.setCredentials({
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+    expiry_date: tokenData.expiry_date
+  });
+
+  // تحديث tokens تلقائياً عند التجديد
+  oAuth2Client.on('tokens', async (tokens) => {
+    const updateData = {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (tokens.access_token) {
+      updateData.access_token = tokens.access_token;
+    }
+    if (tokens.refresh_token) {
+      updateData.refresh_token = tokens.refresh_token;
+    }
+    if (tokens.expiry_date) {
+      updateData.expiry_date = tokens.expiry_date;
+    }
+
+    try {
+      await db
+        .collection('users')
+        .doc(userId)
+        .collection('tokens')
+        .doc('google')
+        .update(updateData);
+      
+      console.log('Tokens updated successfully for user:', userId);
+    } catch (error) {
+      console.error('Error updating tokens:', error);
+    }
+  });
+
+  return oAuth2Client;
+}
+
+/**
+ * توليد رابط OAuth لـ Google
+ */
+function generateGoogleAuthUrl(userId, opId = null) {
+  const oAuth2Client = new google.auth.OAuth2(
+    config.google.clientId,
+    config.google.clientSecret,
+    config.google.redirectUri
+  );
+
+  const scopes = [
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile'
+  ];
+
+  const state = JSON.stringify({ userId, opId });
+
+  return oAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: scopes,
+    prompt: 'consent', // للحصول على refresh_token في كل مرة
+    state: state
+  });
+}
+
+/**
+ * إنشاء رسالة بريد إلكتروني بصيغة raw
+ */
+function makeRawEmail(to, subject, body, from = 'me') {
+  const utf8Subject = `=?utf-8?B?${Buffer.from(subject).toString('base64')}?=`;
+  const messageParts = [
+    `From: ${from}`,
+    `To: ${to}`,
+    'Content-Type: text/plain; charset=utf-8',
+    'MIME-Version: 1.0',
+    `Subject: ${utf8Subject}`,
+    '',
+    body
+  ];
+  
+  const message = messageParts.join('\n');
+  const encodedMessage = Buffer.from(message)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  
+  return encodedMessage;
+}
+
+/**
+ * استدعاء Gemini AI للرد الذكي
+ */
+async function getGeminiResponse(text, userId) {
+  const geminiKey = process.env.GEMINI_API_KEY || functions.config().gemini?.key;
+  
+  if (!geminiKey) {
+    return 'مرحباً! كيف يمكنني مساعدتك؟';
+  }
+
+  try {
+    const prompt = `أنت مساعد ذكي باللغة العربية تساعد المستخدمين في:
+1. إرسال إيميلات عبر Gmail
+2. إضافة أحداث في Google Calendar  
+3. رفع ملفات إلى Google Drive
+
+رسالة المستخدم: "${text}"
+
+رد بشكل طبيعي ومفيد. إذا كان طلب واضح (مثل "أرسل ايميل")، أخبره أنك ستنفذه. إذا كان سؤال عام، أجب بشكل ودي.`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${geminiKey}`,
+      {
+        contents: [{
+          parts: [{ text: prompt }]
+        }]
+      },
+      {
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text || 
+                  'عذراً، لم أستطع فهم طلبك.';
+    
+    return reply.trim();
+    
+  } catch (error) {
+    console.error('Gemini API Error:', error.response?.data || error.message);
+    return 'مرحباً! يمكنني مساعدتك في إرسال إيميلات، إضافة أحداث، أو رفع ملفات. كيف يمكنني مساعدتك؟';
+  }
+}
+
+/**
+ * استدعاء AI Logic لاستخراج النية
+ */
+async function callAiLogic(text, userId) {
+  try {
+    // إذا كان هناك endpoint خارجي
+    if (config.ai.logicUrl && config.ai.logicUrl.includes('http')) {
+      const response = await axios.post(config.ai.logicUrl, {
+        text,
+        userId,
+        language: 'ar'
+      });
+      return response.data;
+    }
+    
+    // استدعاء الـ function المحلية
+    return await extractIntent(text, userId);
+  } catch (error) {
+    console.error('Error calling AI Logic:', error);
+    throw error;
+  }
+}
+
+/**
+ * محاكي بسيط لاستخراج النية (Intent)
+ * في الإنتاج: استخدم Vertex AI, Dialogflow, أو OpenAI
+ */
+function extractIntent(text, userId) {
+  const lowerText = text.toLowerCase();
+  
+  // كلمات مفتاحية للإيميل
+  if (lowerText.includes('ايميل') || lowerText.includes('بريد') || lowerText.includes('email') || lowerText.includes('أرسل')) {
+    // استخراج البريد الإلكتروني
+    const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi;
+    const emails = text.match(emailRegex);
+    
+    // استخراج الموضوع
+    let subject = 'رسالة من Telegram Bot';
+    const subjectMatch = text.match(/بعنوان\s+"([^"]+)"|عنوان\s+"([^"]+)"|بخصوص\s+"([^"]+)"/i);
+    if (subjectMatch) {
+      subject = subjectMatch[1] || subjectMatch[2] || subjectMatch[3];
+    }
+    
+    // استخراج الرسالة
+    let message = text;
+    const messageMatch = text.match(/(?:والرسالة|الرسالة|تقول له|قل له)[:\s]+"?([^"]+)"?/i);
+    if (messageMatch) {
+      message = messageMatch[1];
+    }
+    
+    return {
+      action: 'send_email',
+      confidence: emails ? 0.9 : 0.6,
+      parameters: {
+        recipient: emails ? emails[0] : null,
+        subject: subject,
+        message: message
+      },
+      followup_questions: emails ? [] : ['من فضلك، حدد البريد الإلكتروني للمستلم']
+    };
+  }
+  
+  // كلمات مفتاحية للتقويم
+  if (lowerText.includes('حدث') || lowerText.includes('اجتماع') || lowerText.includes('موعد') || lowerText.includes('calendar')) {
+    const titleMatch = text.match(/(?:حدث|اجتماع|موعد)\s+(?:بعنوان\s+)?"?([^"]+?)"?\s+(?:في|غداً|اليوم)/i);
+    
+    return {
+      action: 'create_event',
+      confidence: 0.8,
+      parameters: {
+        title: titleMatch ? titleMatch[1] : 'حدث جديد',
+        start: null, // يحتاج معالجة التاريخ والوقت
+        end: null,
+        description: text
+      },
+      followup_questions: ['متى تريد الحدث؟ (مثال: غداً الساعة 10 صباحاً)']
+    };
+  }
+  
+  // كلمات مفتاحية للملفات
+  if (lowerText.includes('ملف') || lowerText.includes('رفع') || lowerText.includes('upload') || lowerText.includes('drive')) {
+    return {
+      action: 'upload_file',
+      confidence: 0.7,
+      parameters: {
+        fileName: null,
+        destination: 'root'
+      },
+      followup_questions: ['أرسل الملف الذي تريد رفعه إلى Drive']
+    };
+  }
+  
+  // لم يتم التعرف على النية
+  return {
+    action: 'unknown',
+    confidence: 0.0,
+    parameters: {},
+    followup_questions: ['لم أفهم طلبك. يمكنك أن تطلب:\n• إرسال ايميل\n• إضافة حدث في التقويم\n• رفع ملف إلى Drive']
+  };
+}
+
+// =====================================
+// Cloud Functions
+// =====================================
+
+/**
+ * Telegram Webhook - نقطة استقبال رسائل Telegram
+ */
+exports.telegramWebhook = functions.https.onRequest(async (req, res) => {
+  // التحقق من الطلب
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
+  }
+
+  try {
+    const update = req.body;
+    
+    // تجاهل التحديثات غير النصية
+    if (!update.message || !update.message.text) {
+      return res.status(200).send('ok');
+    }
+
+    const chatId = update.message.chat.id;
+    const text = update.message.text;
+    const userId = `telegram:${chatId}`;
+
+    console.log(`Received message from ${userId}: ${text}`);
+
+    // التحقق من وجود المستخدم وإنشائه إن لزم
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists) {
+      await userRef.set({
+        telegramId: chatId,
+        displayName: update.message.from.first_name || 'User',
+        username: update.message.from.username || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      await sendTelegramMessage(
+        chatId,
+        '🎉 مرحباً بك! أنا بوت يساعدك في إدارة حسابك على Google.\n\n' +
+        'يمكنني مساعدتك في:\n' +
+        '📧 إرسال إيميلات عبر Gmail\n' +
+        '📅 إضافة أحداث في Google Calendar\n' +
+        '📁 رفع ملفات إلى Google Drive\n\n' +
+        'جرّب أن تقول: "أرسل ايميل لأحمد"'
+      );
+    }
+
+    // استخراج النية
+    const intent = await callAiLogic(text, userId);
+
+    // إذا كانت رسالة عادية (محادثة عامة)
+    if (!intent || intent.action === 'unknown' || intent.confidence < 0.5) {
+      const reply = `مرحباً ${update.message.from.first_name}! 👋
+
+أنا بوت ذكي يساعدك في:
+📧 إرسال إيميلات عبر Gmail
+📅 إضافة أحداث في Google Calendar
+📁 رفع ملفات إلى Google Drive
+
+جرب أن تقول:
+• "أرسل ايميل لـ ahmed@example.com"
+• "أضف حدث اجتماع غداً"
+• "ارفع ملف report.pdf"`;
+      
+      await sendTelegramMessage(chatId, reply);
+      return res.status(200).send('chat-reply');
+    }
+    
+    // إذا كان أمر واضح
+    const actionNames = {
+      'send_email': 'إرسال إيميل',
+      'create_event': 'إضافة حدث',
+      'upload_file': 'رفع ملف'
+    };
+    
+    const actionName = actionNames[intent.action] || intent.action;
+    await sendTelegramMessage(chatId, `✅ فهمت! سأقوم بـ: ${actionName}`);
+
+    // تسجيل العملية
+    const opRef = await db.collection('operations').add({
+      userId,
+      action: intent.action,
+      params: intent.parameters || {},
+      status: 'pending',
+      confidence: intent.confidence,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await logToFirestore(userId, 'info', `New operation: ${intent.action}`, { opId: opRef.id });
+
+    // معالجة الإجراء
+    await processAction(intent, userId, chatId, opRef);
+
+    return res.status(200).send('ok');
+
+  } catch (error) {
+    console.error('Error in telegramWebhook:', error);
+    return res.status(500).send('Internal Server Error');
+  }
+});
+
+/**
+ * معالجة الإجراءات حسب النية
+ */
+async function processAction(intent, userId, chatId, opRef) {
+  const { action, parameters } = intent;
+
+  try {
+    // التحقق من وجود tokens
+    let oAuth2Client;
+    try {
+      oAuth2Client = await getGoogleOAuthClient(userId);
+    } catch (error) {
+      if (error.message === 'no_google_token') {
+        const authUrl = generateGoogleAuthUrl(userId, opRef.id);
+        await sendTelegramMessage(
+          chatId,
+          '🔐 لتنفيذ هذا الطلب، أحتاج أن تربط حساب Google الخاص بك.\n\n' +
+          'اضغط على الرابط أدناه وامنح الصلاحيات:\n' +
+          authUrl +
+          '\n\nبعد الربط، أرسل طلبك مرة أخرى.'
+        );
+        
+        await opRef.update({
+          status: 'waiting_auth',
+          authUrl: authUrl
+        });
+        
+        return;
+      }
+      throw error;
+    }
+
+    // تنفيذ الإجراء حسب النوع
+    switch (action) {
+      case 'send_email':
+        await handleSendEmail(oAuth2Client, parameters, userId, chatId, opRef);
+        break;
+
+      case 'create_event':
+        await handleCreateEvent(oAuth2Client, parameters, userId, chatId, opRef);
+        break;
+
+      case 'upload_file':
+        await handleUploadFile(oAuth2Client, parameters, userId, chatId, opRef);
+        break;
+
+      default:
+        await sendTelegramMessage(
+          chatId,
+          `⚠️ الإجراء "${action}" غير مدعوم حالياً.\n\n` +
+          'الإجراءات المدعومة:\n' +
+          '• send_email\n' +
+          '• create_event\n' +
+          '• upload_file'
+        );
+        await opRef.update({
+          status: 'unsupported',
+          finishedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    }
+
+  } catch (error) {
+    console.error('Error processing action:', error);
+    await sendTelegramMessage(
+      chatId,
+      `❌ حدث خطأ أثناء تنفيذ العملية:\n${error.message}`
+    );
+    
+    await opRef.update({
+      status: 'failed',
+      error: error.message,
+      finishedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    await logToFirestore(userId, 'error', 'Action processing failed', {
+      action: intent.action,
+      error: error.message
+    });
+  }
+}
+
+/**
+ * إرسال إيميل عبر Gmail API
+ */
+async function handleSendEmail(oAuth2Client, params, userId, chatId, opRef) {
+  const { recipient, subject, message } = params;
+
+  // التحقق من المعلومات المطلوبة
+  if (!recipient) {
+    await sendTelegramMessage(chatId, '❌ لم تحدد البريد الإلكتروني للمستلم.');
+    await opRef.update({ status: 'failed', error: 'Missing recipient' });
+    return;
+  }
+
+  const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
+  const raw = makeRawEmail(recipient, subject || 'رسالة من Telegram Bot', message || '');
+
+  try {
+    const result = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw }
+    });
+
+    await sendTelegramMessage(
+      chatId,
+      `✅ تم إرسال الإيميل بنجاح إلى <b>${recipient}</b>\n\n` +
+      `الموضوع: ${subject || 'رسالة من Telegram Bot'}`,
+      { parseMode: 'HTML' }
+    );
+
+    await opRef.update({
+      status: 'success',
+      result: { messageId: result.data.id },
+      finishedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await logToFirestore(userId, 'info', 'Email sent successfully', {
+      recipient,
+      messageId: result.data.id
+    });
+
+  } catch (error) {
+    console.error('Error sending email:', error);
+    throw new Error(`فشل إرسال الإيميل: ${error.message}`);
+  }
+}
+
+/**
+ * إضافة حدث في Google Calendar
+ */
+async function handleCreateEvent(oAuth2Client, params, userId, chatId, opRef) {
+  const { title, start, end, description } = params;
+
+  await sendTelegramMessage(
+    chatId,
+    '⚠️ ميزة إضافة الأحداث في التقويم قيد التطوير.\n\n' +
+    'حالياً تحتاج تحديد التاريخ والوقت بدقة.\n' +
+    'مثال: "أضف حدث اجتماع الفريق يوم 2025-11-15 من 10:00 إلى 11:00"'
+  );
+
+  await opRef.update({
+    status: 'in_development',
+    finishedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+/**
+ * رفع ملف إلى Google Drive
+ */
+async function handleUploadFile(oAuth2Client, params, userId, chatId, opRef) {
+  await sendTelegramMessage(
+    chatId,
+    '⚠️ ميزة رفع الملفات إلى Drive قيد التطوير.\n\n' +
+    'سيتم إضافتها قريباً بحيث يمكنك إرسال ملف عبر Telegram ورفعه مباشرة.'
+  );
+
+  await opRef.update({
+    status: 'in_development',
+    finishedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+/**
+ * OAuth Callback - معالجة رد Google OAuth
+ */
+exports.oauthCallback = functions.https.onRequest(async (req, res) => {
+  try {
+    const { code, state } = req.query;
+
+    if (!code) {
+      return res.status(400).send('Missing authorization code');
+    }
+
+    // فك تشفير state
+    let stateData;
+    try {
+      stateData = JSON.parse(state);
+    } catch (error) {
+      return res.status(400).send('Invalid state parameter');
+    }
+
+    const { userId, opId } = stateData;
+
+    // تبديل code بـ tokens
+    const oAuth2Client = new google.auth.OAuth2(
+      config.google.clientId,
+      config.google.clientSecret,
+      config.google.redirectUri
+    );
+
+    const { tokens } = await oAuth2Client.getToken(code);
+
+    // حفظ tokens في Firestore
+    await db
+      .collection('users')
+      .doc(userId)
+      .collection('tokens')
+      .doc('google')
+      .set({
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        scope: tokens.scope,
+        expiry_date: tokens.expiry_date,
+        token_type: tokens.token_type,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    await logToFirestore(userId, 'info', 'Google account connected successfully');
+
+    // إرسال رسالة تأكيد عبر Telegram
+    const telegramId = userId.replace('telegram:', '');
+    await sendTelegramMessage(
+      telegramId,
+      '✅ تم ربط حساب Google بنجاح!\n\n' +
+      'يمكنك الآن استخدام جميع الميزات. جرّب:\n' +
+      '• أرسل ايميل لـ example@gmail.com\n' +
+      '• أضف حدث في التقويم\n' +
+      '• ارفع ملف'
+    );
+
+    // صفحة HTML للنجاح
+    res.send(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>تم الربط بنجاح</title>
+        <style>
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+          }
+          .container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            text-align: center;
+            max-width: 500px;
+          }
+          .success-icon {
+            font-size: 80px;
+            margin-bottom: 20px;
+          }
+          h1 {
+            color: #2d3748;
+            margin-bottom: 10px;
+          }
+          p {
+            color: #718096;
+            font-size: 18px;
+            line-height: 1.6;
+          }
+          .button {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 30px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="success-icon">✅</div>
+          <h1>تم الربط بنجاح!</h1>
+          <p>تم ربط حساب Google الخاص بك مع Telegram Bot</p>
+          <p>ارجع إلى Telegram وجرّب إرسال أمر جديد</p>
+          <a href="https://t.me/${process.env.BOT_USERNAME || 'YourBot'}" class="button">افتح Telegram</a>
+        </div>
+      </body>
+      </html>
+    `);
+
+  } catch (error) {
+    console.error('Error in OAuth callback:', error);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+      <head>
+        <meta charset="UTF-8">
+        <title>خطأ</title>
+        <style>
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f7fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+          }
+          .container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            text-align: center;
+          }
+          .error-icon {
+            font-size: 60px;
+            margin-bottom: 20px;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="error-icon">❌</div>
+          <h1>حدث خطأ</h1>
+          <p>${error.message}</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+});
+
+/**
+ * AI Logic Endpoint - محاكي بسيط (يمكن استبداله بخدمة خارجية)
+ */
+exports.aiLogic = functions.https.onRequest(async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+
+  try {
+    const { text, userId, language } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: 'Missing text parameter' });
+    }
+
+    const intent = extractIntent(text, userId);
+    
+    return res.status(200).json(intent);
+
+  } catch (error) {
+    console.error('Error in AI Logic:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// =====================================
+// Utility Functions للاستخدام المستقبلي
+// =====================================
+
+/**
+ * دالة scheduled لتنظيف العمليات القديمة (اختياري)
+ */
+exports.cleanupOldOperations = functions.pubsub
+  .schedule('every 24 hours')
+  .onRun(async (context) => {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const snapshot = await db
+      .collection('operations')
+      .where('createdAt', '<', thirtyDaysAgo)
+      .limit(500)
+      .get();
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => {
+      batch.delete(doc.ref);
+    });
+
+    await batch.commit();
+    console.log(`Deleted ${snapshot.size} old operations`);
+  });

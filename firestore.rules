@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      // يمكن للمستخدم قراءة بياناته فقط
+      allow read: if isOwner(userId);
+      
+      // لا يمكن الكتابة مباشرة - فقط عبر Cloud Functions
+      allow write: if false;
+      
+      // Tokens subcollection - محمي بالكامل
+      match /tokens/{tokenDoc} {
+        // فقط Cloud Functions (admin SDK) يمكنه الوصول
+        allow read, write: if false;
+      }
+    }
+    
+    // Operations collection
+    match /operations/{opId} {
+      // يمكن للمستخدم قراءة عملياته فقط
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // يمكن إنشاء عمليات جديدة فقط
+      allow create: if isAuthenticated();
+      
+      // لا يمكن التعديل أو الحذف
+      allow update, delete: if false;
+    }
+    
+    // Logs collection - للقراءة فقط من admin
+    match /logs/{logId} {
+      allow read: if false; // فقط عبر Cloud Functions/Console
+      allow write: if false;
+    }
+    
+    // Default: deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
